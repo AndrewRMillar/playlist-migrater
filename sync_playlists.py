@@ -16,6 +16,7 @@ Authenticatie:
 import argparse
 import logging
 import os
+import ssl
 import sys
 import time
 import webbrowser
@@ -153,38 +154,87 @@ class _OAuthCallbackHandler(BaseHTTPRequestHandler):
         pass
 
 
-def _run_local_callback_server(port: int) -> str:
+def _run_local_callback_server(port: int, use_ssl: bool = False) -> str:
     server = HTTPServer(("localhost", port), _OAuthCallbackHandler)
-    server.handle_request()          # wacht op één verzoek
+    if use_ssl:
+        cert = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
+        key  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
+        if not (os.path.exists(cert) and os.path.exists(key)):
+            raise FileNotFoundError(
+                "cert.pem / key.pem niet gevonden. Genereer ze met:\n"
+                "  openssl req -x509 -newkey rsa:4096 -keyout key.pem "
+                "-out cert.pem -days 365 -nodes -subj '/CN=localhost'"
+            )
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(cert, key)
+        server.socket = ctx.wrap_socket(server.socket, server_side=True)
+    server.handle_request()
     return _OAuthCallbackHandler.auth_code or ""
 
 
 def spotify_authorize() -> None:
-    """Voer de volledige Authorization Code Flow uit voor Spotify."""
+    """
+    Voer de Spotify Authorization Code Flow uit via de copy-paste methode.
+
+    Spotify vereist HTTP (niet HTTPS) voor localhost-callbacks.
+    Stel in de Spotify Developer Dashboard in:
+        Redirect URI = http://localhost:8888/callback
+
+    Na het akkoord gaan stuurt Spotify je browser naar een URL die
+    'kan niet worden bereikt' geeft — dat is normaal. Kopieer die volledige
+    URL en plak hem hieronder in de terminal.
+    """
     global SPOTIFY_ACCESS_TOKEN, SPOTIFY_REFRESH_TOKEN
+
+    # Forceer altijd http://localhost voor Spotify (https werkt niet)
+    redirect_uri = SPOTIFY_REDIRECT_URI
+    if redirect_uri.startswith("https://localhost"):
+        redirect_uri = redirect_uri.replace("https://", "http://", 1)
+        log.warning(
+            "SPOTIFY_REDIRECT_URI begon met https:// — omgezet naar http:// "
+            "omdat Spotify https://localhost afwijst. Zorg dat de Dashboard "
+            "Redirect URI ook 'http://localhost:8888/callback' is."
+        )
 
     params = {
         "client_id":     SPOTIFY_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri":  SPOTIFY_REDIRECT_URI,
+        "redirect_uri":  redirect_uri,
         "scope":         SPOTIFY_SCOPES,
     }
-    url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
-    log.info("Open Spotify-autorisatie-URL:\n%s", url)
-    webbrowser.open(url)
+    auth_url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
 
-    port = int(urlparse(SPOTIFY_REDIRECT_URI).port or 8888)
-    log.info("Wacht op callback op poort %d …", port)
-    code = _run_local_callback_server(port)
-    if not code:
-        raise RuntimeError("Geen autorisatiecode ontvangen van Spotify.")
+    print("\n" + "=" * 60)
+    print("STAP 1: Open de volgende URL in je browser en ga akkoord:")
+    print("=" * 60)
+    print(auth_url)
+    print("=" * 60)
+    webbrowser.open(auth_url)
+
+    print("\nSTAP 2: Na het akkoord gaan stuurt Spotify je naar een pagina")
+    print("        die 'kan niet worden bereikt' geeft. Dat klopt.")
+    print("        Kopieer de VOLLEDIGE URL uit de adresbalk en plak")
+    print("        hem hieronder:\n")
+    callback_url = input("Plak de callback-URL hier: ").strip()
+
+    # Extraheer de code uit de geplakte URL
+    parsed = urlparse(callback_url)
+    qs = parse_qs(parsed.query)
+
+    if "error" in qs:
+        raise RuntimeError(f"Spotify gaf een fout terug: {qs['error']}")
+    if "code" not in qs:
+        raise RuntimeError(
+            "Geen 'code' gevonden in de URL. Controleer of je de volledige URL hebt geplakt."
+        )
+    code = qs["code"][0]
 
     resp = requests.post(
         SPOTIFY_TOKEN_URL,
         data={
             "grant_type":   "authorization_code",
             "code":         code,
-            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "client_id":    SPOTIFY_CLIENT_ID,
             "client_secret": SPOTIFY_CLIENT_SECRET,
         },
@@ -197,7 +247,7 @@ def spotify_authorize() -> None:
 
     set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN",  SPOTIFY_ACCESS_TOKEN)
     set_key(ENV_FILE, "SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN)
-    log.info("Spotify-tokens opgeslagen in %s.", ENV_FILE)
+    log.info("✓ Spotify-tokens opgeslagen in %s.", ENV_FILE)
 
 
 # ---------------------------------------------------------------------------
@@ -237,50 +287,92 @@ def tidal_refresh_access_token() -> None:
 
 
 def tidal_authorize() -> None:
-    """Voer de volledige Authorization Code Flow uit voor Tidal."""
+    """
+    Voer de Tidal Authorization Code Flow uit via de copy-paste methode.
+
+    Zorg dat in het Tidal Developer Dashboard staat:
+        Redirect URI = http://127.0.0.1:8889/callback
+
+    Tidal stuurt je na akkoord naar een pagina die niet bestaat —
+    kopieer die volledige URL en plak hem in de terminal.
+    """
     global TIDAL_ACCESS_TOKEN, TIDAL_REFRESH_TOKEN, TIDAL_USER_ID
 
-    params = {
+    # Forceer 127.0.0.1 (Tidal heeft moeite met 'localhost' als hostnaam)
+    redirect_uri = TIDAL_REDIRECT_URI.replace("localhost", "127.0.0.1")
+
+    # Bouw de URL handmatig: Tidal wil '+' als scope-scheidingsteken,
+    # maar standaard urlencode() produceert '%20'. urlencode met
+    # quote_via=urllib.parse.quote_plus lost dit op.
+    from urllib.parse import quote_plus
+    scope_encoded = "+".join(TIDAL_SCOPES.split())
+    params = urlencode({
         "response_type": "code",
         "client_id":     TIDAL_CLIENT_ID,
-        "redirect_uri":  TIDAL_REDIRECT_URI,
-        "scope":         TIDAL_SCOPES,
-    }
-    url = TIDAL_AUTH_URL + "?" + urlencode(params)
-    log.info("Open Tidal-autorisatie-URL:\n%s", url)
-    webbrowser.open(url)
+        "redirect_uri":  redirect_uri,
+    })
+    auth_url = f"{TIDAL_AUTH_URL}?{params}&scope={scope_encoded}"
 
-    port = int(urlparse(TIDAL_REDIRECT_URI).port or 8889)
-    log.info("Wacht op callback op poort %d …", port)
-    code = _run_local_callback_server(port)
-    if not code:
-        raise RuntimeError("Geen autorisatiecode ontvangen van Tidal.")
+    print("\n" + "=" * 60)
+    print("STAP 1: Open de volgende URL in je browser en log in bij Tidal:")
+    print("=" * 60)
+    print(auth_url)
+    print("=" * 60)
+    webbrowser.open(auth_url)
+
+    print("\nSTAP 2: Na het akkoord gaan stuurt Tidal je naar een pagina")
+    print("        die 'kan niet worden bereikt' geeft. Dat klopt.")
+    print("        Kopieer de VOLLEDIGE URL uit de adresbalk en plak")
+    print("        hem hieronder:\n")
+    callback_url = input("Plak de callback-URL hier: ").strip()
+
+    parsed = urlparse(callback_url)
+    qs = parse_qs(parsed.query)
+
+    if "error" in qs:
+        raise RuntimeError(
+            f"Tidal gaf een fout terug: {qs['error']}\n"
+            "Controleer of de Redirect URI in het Tidal Dashboard exact\n"
+            f"'{redirect_uri}' is, en of de scopes zijn goedgekeurd."
+        )
+    if "code" not in qs:
+        raise RuntimeError(
+            "Geen 'code' gevonden in de URL. "
+            "Controleer of je de volledige callback-URL hebt geplakt."
+        )
+    code = qs["code"][0]
 
     resp = requests.post(
         TIDAL_TOKEN_URL,
         data={
             "grant_type":   "authorization_code",
             "code":         code,
-            "redirect_uri": TIDAL_REDIRECT_URI,
+            "redirect_uri": redirect_uri,
             "client_id":    TIDAL_CLIENT_ID,
             "client_secret": TIDAL_CLIENT_SECRET,
         },
         timeout=15,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            f"Token-uitwisseling mislukt ({resp.status_code}): {resp.text}"
+        )
     tokens = resp.json()
     TIDAL_ACCESS_TOKEN  = tokens["access_token"]
     TIDAL_REFRESH_TOKEN = tokens.get("refresh_token", TIDAL_REFRESH_TOKEN)
 
     # Haal user-ID op
-    me = _get("https://openapi.tidal.com/v2/users/me",
-              headers=tidal_headers())
-    TIDAL_USER_ID = str(me.get("data", {}).get("id", ""))
+    try:
+        me = _get("https://openapi.tidal.com/v2/users/me", headers=tidal_headers())
+        TIDAL_USER_ID = str(me.get("data", {}).get("id", ""))
+    except Exception as exc:
+        log.warning("Kon Tidal user-ID niet automatisch ophalen: %s", exc)
+        TIDAL_USER_ID = input("Voer je Tidal user-ID handmatig in: ").strip()
 
     set_key(ENV_FILE, "TIDAL_ACCESS_TOKEN",  TIDAL_ACCESS_TOKEN)
     set_key(ENV_FILE, "TIDAL_REFRESH_TOKEN", TIDAL_REFRESH_TOKEN)
     set_key(ENV_FILE, "TIDAL_USER_ID",       TIDAL_USER_ID)
-    log.info("Tidal-tokens en user-ID opgeslagen in %s.", ENV_FILE)
+    log.info("✓ Tidal-tokens en user-ID opgeslagen in %s.", ENV_FILE)
 
 
 # ---------------------------------------------------------------------------
