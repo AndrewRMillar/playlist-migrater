@@ -1,29 +1,36 @@
 """
 sync_playlists.py
 -----------------
-Migreert Spotify-afspeellijsten naar Tidal via ISRC-matching.
+Migreert Spotify-afspeellijsten naar Tidal.
 
-Vereisten:
-  - Python 3.10+
-  - pip install -r requirements.txt
-  - Gevulde .env (zie .env.example)
+Spotify : OAuth2 Authorization Code Flow (copy-paste callback)
+Tidal   : OAuth2 Device Flow via tidalapi (geen redirect URI nodig)
 
-Authenticatie:
-  Voer eerst `python sync_playlists.py --auth` uit om tokens op te halen,
-  of sla ze handmatig op in .env (zie README).
+Gebruik:
+    pip install -r requirements.txt
+
+    # Eenmalig authenticeren:
+    python sync_playlists.py --auth
+
+    # Of afzonderlijk:
+    python sync_playlists.py --auth-spotify
+    python sync_playlists.py --auth-tidal
+
+    # Migratie starten:
+    python sync_playlists.py
 """
 
 import argparse
 import logging
 import os
-import ssl
+import pickle
 import sys
 import time
 import webbrowser
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
+import tidalapi
 from dotenv import load_dotenv, set_key
 
 # ---------------------------------------------------------------------------
@@ -42,40 +49,49 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Spotify
-SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+# Spotify credentials (uit .env)
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8888/callback")
-SPOTIFY_ACCESS_TOKEN  = os.getenv("SPOTIFY_ACCESS_TOKEN", "")
+SPOTIFY_REDIRECT_URI = os.getenv(
+    "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"
+)
+SPOTIFY_ACCESS_TOKEN = os.getenv("SPOTIFY_ACCESS_TOKEN", "")
 SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "")
 
-# Tidal
-TIDAL_CLIENT_ID       = os.getenv("TIDAL_CLIENT_ID", "")
-TIDAL_CLIENT_SECRET   = os.getenv("TIDAL_CLIENT_SECRET", "")
-TIDAL_REDIRECT_URI    = os.getenv("TIDAL_REDIRECT_URI", "http://localhost:8889/callback")
-TIDAL_ACCESS_TOKEN    = os.getenv("TIDAL_ACCESS_TOKEN", "")
-TIDAL_REFRESH_TOKEN   = os.getenv("TIDAL_REFRESH_TOKEN", "")
-TIDAL_USER_ID         = os.getenv("TIDAL_USER_ID", "")
-TIDAL_COUNTRY_CODE    = os.getenv("TIDAL_COUNTRY_CODE", "NL")
+# Tidal sessie wordt opgeslagen als pickle (geen losse tokens in .env nodig)
+TIDAL_SESSION_FILE = "tidal_session.pkl"
+TIDAL_COUNTRY_CODE = os.getenv("TIDAL_COUNTRY_CODE", "NL")
 
-# Rate-limit pauzes (seconden)
-REQUEST_DELAY         = 0.3   # tussen gewone API-calls
-RETRY_AFTER_DEFAULT   = 5     # als Retry-After header ontbreekt
-MAX_RETRIES           = 3
-
+# Rate-limit instellingen
+REQUEST_DELAY = 0.3
+RETRY_AFTER_DEFAULT = 5
+MAX_RETRIES = 3
 ENV_FILE = ".env"
 
 # ---------------------------------------------------------------------------
-# Generieke HTTP-hulpfuncties
+# Generieke HTTP-hulpfunctie (voor Spotify)
 # ---------------------------------------------------------------------------
 
+
 def _get(url: str, headers: dict, params: dict | None = None) -> dict:
-    """GET met automatische retry bij 429 (rate limit)."""
+    """GET met automatische retry bij 429 (rate limit) en 5xx (serverfout)."""
     for attempt in range(1, MAX_RETRIES + 1):
         resp = requests.get(url, headers=headers, params=params, timeout=15)
         if resp.status_code == 429:
             wait = int(resp.headers.get("Retry-After", RETRY_AFTER_DEFAULT))
-            log.warning("Rate-limit geraakt (GET %s). Wacht %ds …", url, wait)
+            log.warning("Rate-limit (GET %s). Wacht %ds ...", url, wait)
+            time.sleep(wait)
+            continue
+        if resp.status_code in (500, 502, 503, 504):
+            wait = RETRY_AFTER_DEFAULT * attempt
+            log.warning(
+                "Serverfout %d op %s (poging %d/%d). Wacht %ds ...",
+                resp.status_code,
+                url,
+                attempt,
+                MAX_RETRIES,
+                wait,
+            )
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -84,295 +100,171 @@ def _get(url: str, headers: dict, params: dict | None = None) -> dict:
     raise RuntimeError(f"GET {url} mislukt na {MAX_RETRIES} pogingen.")
 
 
-def _post(url: str, headers: dict, json_body: dict | None = None,
-          data: dict | None = None) -> dict:
-    """POST met automatische retry bij 429."""
-    for attempt in range(1, MAX_RETRIES + 1):
-        resp = requests.post(url, headers=headers, json=json_body,
-                             data=data, timeout=15)
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", RETRY_AFTER_DEFAULT))
-            log.warning("Rate-limit geraakt (POST %s). Wacht %ds …", url, wait)
-            time.sleep(wait)
-            continue
-        if resp.status_code in (200, 201, 204):
-            time.sleep(REQUEST_DELAY)
-            try:
-                return resp.json()
-            except Exception:
-                return {}
-        resp.raise_for_status()
-    raise RuntimeError(f"POST {url} mislukt na {MAX_RETRIES} pogingen.")
-
-
 # ---------------------------------------------------------------------------
-# OAuth2 – Spotify
+# Spotify OAuth2 - Authorization Code Flow (copy-paste)
 # ---------------------------------------------------------------------------
 
-SPOTIFY_AUTH_URL  = "https://accounts.spotify.com/authorize"
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_SCOPES    = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative"
 
 
 def spotify_headers() -> dict:
-    return {"Authorization": f"Bearer {SPOTIFY_ACCESS_TOKEN}"}
+    # Lees altijd de meest recente waarde van SPOTIFY_ACCESS_TOKEN
+    return {
+        "Authorization": f"Bearer {os.getenv('SPOTIFY_ACCESS_TOKEN', SPOTIFY_ACCESS_TOKEN)}"
+    }
 
 
 def spotify_refresh_access_token() -> None:
-    """Vernieuw het Spotify access-token met het refresh-token."""
     global SPOTIFY_ACCESS_TOKEN
     resp = requests.post(
         SPOTIFY_TOKEN_URL,
         data={
-            "grant_type":    "refresh_token",
+            "grant_type": "refresh_token",
             "refresh_token": SPOTIFY_REFRESH_TOKEN,
-            "client_id":     SPOTIFY_CLIENT_ID,
+            "client_id": SPOTIFY_CLIENT_ID,
             "client_secret": SPOTIFY_CLIENT_SECRET,
         },
         timeout=15,
     )
     resp.raise_for_status()
-    data = resp.json()
-    SPOTIFY_ACCESS_TOKEN = data["access_token"]
-    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN", SPOTIFY_ACCESS_TOKEN)
+    SPOTIFY_ACCESS_TOKEN = resp.json()["access_token"]
+    # Sla op in .env én in omgevingsvariabele zodat spotify_headers() het direct oppikt
+    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN", SPOTIFY_ACCESS_TOKEN, quote_mode="never")
+    os.environ["SPOTIFY_ACCESS_TOKEN"] = SPOTIFY_ACCESS_TOKEN
     log.info("Spotify access-token vernieuwd.")
-
-
-class _OAuthCallbackHandler(BaseHTTPRequestHandler):
-    """Eenmalige HTTP-server om de OAuth-callback op te vangen."""
-
-    auth_code: str | None = None
-
-    def do_GET(self):  # noqa: N802
-        qs = parse_qs(urlparse(self.path).query)
-        _OAuthCallbackHandler.auth_code = qs.get("code", [None])[0]
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Autorisatie gelukt! Je kunt dit venster sluiten.")
-
-    def log_message(self, *_):  # suppress server logs
-        pass
-
-
-def _run_local_callback_server(port: int, use_ssl: bool = False) -> str:
-    server = HTTPServer(("localhost", port), _OAuthCallbackHandler)
-    if use_ssl:
-        cert = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cert.pem")
-        key  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "key.pem")
-        if not (os.path.exists(cert) and os.path.exists(key)):
-            raise FileNotFoundError(
-                "cert.pem / key.pem niet gevonden. Genereer ze met:\n"
-                "  openssl req -x509 -newkey rsa:4096 -keyout key.pem "
-                "-out cert.pem -days 365 -nodes -subj '/CN=localhost'"
-            )
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        ctx.load_cert_chain(cert, key)
-        server.socket = ctx.wrap_socket(server.socket, server_side=True)
-    server.handle_request()
-    return _OAuthCallbackHandler.auth_code or ""
 
 
 def spotify_authorize() -> None:
     """
-    Voer de Spotify Authorization Code Flow uit via de copy-paste methode.
-
-    Spotify vereist HTTP (niet HTTPS) voor localhost-callbacks.
-    Stel in de Spotify Developer Dashboard in:
-        Redirect URI = http://localhost:8888/callback
-
-    Na het akkoord gaan stuurt Spotify je browser naar een URL die
-    'kan niet worden bereikt' geeft — dat is normaal. Kopieer die volledige
-    URL en plak hem hieronder in de terminal.
+    Spotify Authorization Code Flow via copy-paste.
+    Stel in de Spotify Dashboard in: Redirect URI = http://127.0.0.1:8888/callback
     """
     global SPOTIFY_ACCESS_TOKEN, SPOTIFY_REFRESH_TOKEN
 
-    # Forceer altijd http://localhost voor Spotify (https werkt niet)
-    redirect_uri = SPOTIFY_REDIRECT_URI
-    if redirect_uri.startswith("https://localhost"):
-        redirect_uri = redirect_uri.replace("https://", "http://", 1)
-        log.warning(
-            "SPOTIFY_REDIRECT_URI begon met https:// — omgezet naar http:// "
-            "omdat Spotify https://localhost afwijst. Zorg dat de Dashboard "
-            "Redirect URI ook 'http://localhost:8888/callback' is."
-        )
-
     params = {
-        "client_id":     SPOTIFY_CLIENT_ID,
+        "client_id": SPOTIFY_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri":  redirect_uri,
-        "scope":         SPOTIFY_SCOPES,
+        "redirect_uri": SPOTIFY_REDIRECT_URI,
+        "scope": SPOTIFY_SCOPES,
     }
     auth_url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
 
     print("\n" + "=" * 60)
-    print("STAP 1: Open de volgende URL in je browser en ga akkoord:")
+    print("SPOTIFY - Stap 1: Open deze URL en ga akkoord:")
     print("=" * 60)
     print(auth_url)
     print("=" * 60)
     webbrowser.open(auth_url)
 
-    print("\nSTAP 2: Na het akkoord gaan stuurt Spotify je naar een pagina")
-    print("        die 'kan niet worden bereikt' geeft. Dat klopt.")
-    print("        Kopieer de VOLLEDIGE URL uit de adresbalk en plak")
-    print("        hem hieronder:\n")
+    print("\nStap 2: Na akkoord stuurt Spotify je naar een URL die")
+    print("        'kan niet worden bereikt' geeft. Dat klopt.")
+    print("        Kopieer de VOLLEDIGE URL en plak hem hieronder:\n")
     callback_url = input("Plak de callback-URL hier: ").strip()
 
-    # Extraheer de code uit de geplakte URL
-    parsed = urlparse(callback_url)
-    qs = parse_qs(parsed.query)
-
+    qs = parse_qs(urlparse(callback_url).query)
     if "error" in qs:
-        raise RuntimeError(f"Spotify gaf een fout terug: {qs['error']}")
+        raise RuntimeError(f"Spotify fout: {qs['error']}")
     if "code" not in qs:
-        raise RuntimeError(
-            "Geen 'code' gevonden in de URL. Controleer of je de volledige URL hebt geplakt."
-        )
-    code = qs["code"][0]
+        raise RuntimeError("Geen 'code' in de URL. Volledige URL geplakt?")
 
     resp = requests.post(
         SPOTIFY_TOKEN_URL,
         data={
-            "grant_type":   "authorization_code",
-            "code":         code,
-            "redirect_uri": redirect_uri,
-            "client_id":    SPOTIFY_CLIENT_ID,
+            "grant_type": "authorization_code",
+            "code": qs["code"][0],
+            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "client_id": SPOTIFY_CLIENT_ID,
             "client_secret": SPOTIFY_CLIENT_SECRET,
         },
         timeout=15,
     )
     resp.raise_for_status()
     tokens = resp.json()
-    SPOTIFY_ACCESS_TOKEN  = tokens["access_token"]
+    SPOTIFY_ACCESS_TOKEN = tokens["access_token"]
     SPOTIFY_REFRESH_TOKEN = tokens.get("refresh_token", SPOTIFY_REFRESH_TOKEN)
 
-    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN",  SPOTIFY_ACCESS_TOKEN)
-    set_key(ENV_FILE, "SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN)
-    log.info("✓ Spotify-tokens opgeslagen in %s.", ENV_FILE)
-
-
-# ---------------------------------------------------------------------------
-# OAuth2 – Tidal
-# ---------------------------------------------------------------------------
-
-TIDAL_AUTH_URL  = "https://login.tidal.com/oauth2/authorize"
-TIDAL_TOKEN_URL = "https://auth.tidal.com/v1/oauth2/token"
-TIDAL_SCOPES    = "playlists.read playlists.write user.read"
-
-
-def tidal_headers() -> dict:
-    return {
-        "Authorization": f"Bearer {TIDAL_ACCESS_TOKEN}",
-        "Content-Type":  "application/vnd.api+json",
-    }
-
-
-def tidal_refresh_access_token() -> None:
-    """Vernieuw het Tidal access-token met het refresh-token."""
-    global TIDAL_ACCESS_TOKEN
-    resp = requests.post(
-        TIDAL_TOKEN_URL,
-        data={
-            "grant_type":    "refresh_token",
-            "refresh_token": TIDAL_REFRESH_TOKEN,
-            "client_id":     TIDAL_CLIENT_ID,
-            "client_secret": TIDAL_CLIENT_SECRET,
-        },
-        timeout=15,
+    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN", SPOTIFY_ACCESS_TOKEN, quote_mode="never")
+    set_key(
+        ENV_FILE, "SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN, quote_mode="never"
     )
-    resp.raise_for_status()
-    data = resp.json()
-    TIDAL_ACCESS_TOKEN = data["access_token"]
-    set_key(ENV_FILE, "TIDAL_ACCESS_TOKEN", TIDAL_ACCESS_TOKEN)
-    log.info("Tidal access-token vernieuwd.")
+    log.info("Spotify-tokens opgeslagen in %s.", ENV_FILE)
 
 
-def tidal_authorize() -> None:
+# ---------------------------------------------------------------------------
+# Tidal - via tidalapi (Device Flow, geen redirect URI nodig)
+# ---------------------------------------------------------------------------
+
+
+def tidal_load_or_login() -> tidalapi.Session:
     """
-    Voer de Tidal Authorization Code Flow uit via de copy-paste methode.
-
-    Zorg dat in het Tidal Developer Dashboard staat:
-        Redirect URI = http://127.0.0.1:8889/callback
-
-    Tidal stuurt je na akkoord naar een pagina die niet bestaat —
-    kopieer die volledige URL en plak hem in de terminal.
+    Laad een bestaande Tidal-sessie of start een nieuwe Device Flow login.
+    De sessie wordt opgeslagen in tidal_session.pkl.
     """
-    global TIDAL_ACCESS_TOKEN, TIDAL_REFRESH_TOKEN, TIDAL_USER_ID
+    session = tidalapi.Session()
 
-    # Forceer 127.0.0.1 (Tidal heeft moeite met 'localhost' als hostnaam)
-    redirect_uri = TIDAL_REDIRECT_URI.replace("localhost", "127.0.0.1")
+    if os.path.exists(TIDAL_SESSION_FILE):
+        try:
+            with open(TIDAL_SESSION_FILE, "rb") as f:
+                data = pickle.load(f)
+            ok = session.load_oauth_session(
+                data["token_type"],
+                data["access_token"],
+                data["refresh_token"],
+                data["expiry_time"],
+            )
+            if ok and session.check_login():
+                log.info("Tidal-sessie geladen uit %s.", TIDAL_SESSION_FILE)
+                return session
+            log.info("Opgeslagen Tidal-sessie verlopen, opnieuw inloggen ...")
+        except Exception as exc:
+            log.warning("Kon Tidal-sessie niet laden: %s", exc)
 
-    # Bouw de URL handmatig: Tidal wil '+' als scope-scheidingsteken,
-    # maar standaard urlencode() produceert '%20'. urlencode met
-    # quote_via=urllib.parse.quote_plus lost dit op.
-    from urllib.parse import quote_plus
-    scope_encoded = "+".join(TIDAL_SCOPES.split())
-    params = urlencode({
-        "response_type": "code",
-        "client_id":     TIDAL_CLIENT_ID,
-        "redirect_uri":  redirect_uri,
-    })
-    auth_url = f"{TIDAL_AUTH_URL}?{params}&scope={scope_encoded}"
+    return tidal_authorize()
+
+
+def tidal_authorize(session: tidalapi.Session | None = None) -> tidalapi.Session:
+    """
+    Start een Tidal Device Flow login.
+    Geen redirect URI of lokale server nodig - de gebruiker bezoekt
+    link.tidal.com en voert een code in.
+    """
+    if session is None:
+        session = tidalapi.Session()
 
     print("\n" + "=" * 60)
-    print("STAP 1: Open de volgende URL in je browser en log in bij Tidal:")
+    print("TIDAL - Device Flow login (geen redirect URI nodig)")
     print("=" * 60)
-    print(auth_url)
-    print("=" * 60)
-    webbrowser.open(auth_url)
 
-    print("\nSTAP 2: Na het akkoord gaan stuurt Tidal je naar een pagina")
-    print("        die 'kan niet worden bereikt' geeft. Dat klopt.")
-    print("        Kopieer de VOLLEDIGE URL uit de adresbalk en plak")
-    print("        hem hieronder:\n")
-    callback_url = input("Plak de callback-URL hier: ").strip()
+    login, future = session.login_oauth()
 
-    parsed = urlparse(callback_url)
-    qs = parse_qs(parsed.query)
+    print(f"\nOpen deze URL in je browser:")
+    print(f"  {login.verification_uri_complete}")
+    print(f"\nOf ga naar:  {login.verification_uri}")
+    print(f"En voer in:  {login.user_code}")
+    webbrowser.open(login.verification_uri_complete)
+    print("\nWachten tot je ingelogd bent ...")
 
-    if "error" in qs:
-        raise RuntimeError(
-            f"Tidal gaf een fout terug: {qs['error']}\n"
-            "Controleer of de Redirect URI in het Tidal Dashboard exact\n"
-            f"'{redirect_uri}' is, en of de scopes zijn goedgekeurd."
-        )
-    if "code" not in qs:
-        raise RuntimeError(
-            "Geen 'code' gevonden in de URL. "
-            "Controleer of je de volledige callback-URL hebt geplakt."
-        )
-    code = qs["code"][0]
+    future.result()  # blokkeert tot login voltooid
 
-    resp = requests.post(
-        TIDAL_TOKEN_URL,
-        data={
-            "grant_type":   "authorization_code",
-            "code":         code,
-            "redirect_uri": redirect_uri,
-            "client_id":    TIDAL_CLIENT_ID,
-            "client_secret": TIDAL_CLIENT_SECRET,
-        },
-        timeout=15,
-    )
-    if not resp.ok:
-        raise RuntimeError(
-            f"Token-uitwisseling mislukt ({resp.status_code}): {resp.text}"
-        )
-    tokens = resp.json()
-    TIDAL_ACCESS_TOKEN  = tokens["access_token"]
-    TIDAL_REFRESH_TOKEN = tokens.get("refresh_token", TIDAL_REFRESH_TOKEN)
+    if not session.check_login():
+        raise RuntimeError("Tidal login mislukt.")
 
-    # Haal user-ID op
-    try:
-        me = _get("https://openapi.tidal.com/v2/users/me", headers=tidal_headers())
-        TIDAL_USER_ID = str(me.get("data", {}).get("id", ""))
-    except Exception as exc:
-        log.warning("Kon Tidal user-ID niet automatisch ophalen: %s", exc)
-        TIDAL_USER_ID = input("Voer je Tidal user-ID handmatig in: ").strip()
+    _tidal_save_session(session)
+    log.info("Tidal-sessie opgeslagen in %s.", TIDAL_SESSION_FILE)
+    return session
 
-    set_key(ENV_FILE, "TIDAL_ACCESS_TOKEN",  TIDAL_ACCESS_TOKEN)
-    set_key(ENV_FILE, "TIDAL_REFRESH_TOKEN", TIDAL_REFRESH_TOKEN)
-    set_key(ENV_FILE, "TIDAL_USER_ID",       TIDAL_USER_ID)
-    log.info("✓ Tidal-tokens en user-ID opgeslagen in %s.", ENV_FILE)
+
+def _tidal_save_session(session: tidalapi.Session) -> None:
+    data = {
+        "token_type": session.token_type,
+        "access_token": session.access_token,
+        "refresh_token": session.refresh_token,
+        "expiry_time": session.expiry_time,
+    }
+    with open(TIDAL_SESSION_FILE, "wb") as f:
+        pickle.dump(data, f)
 
 
 # ---------------------------------------------------------------------------
@@ -383,171 +275,144 @@ SPOTIFY_BASE = "https://api.spotify.com/v1"
 
 
 def spotify_get_current_user_id() -> str:
-    data = _get(f"{SPOTIFY_BASE}/me", headers=spotify_headers())
-    return data["id"]
+    return _get(f"{SPOTIFY_BASE}/me", headers=spotify_headers())["id"]
 
 
-def spotify_get_all_playlists(user_id: str) -> list[dict]:
-    """Haalt alle playlists op van de ingelogde gebruiker (met paginering)."""
+def spotify_get_all_playlists() -> list[dict]:
     playlists: list[dict] = []
-    url = f"{SPOTIFY_BASE}/users/{user_id}/playlists"
-    params = {"limit": 50, "offset": 0}
+    limit = 50
+    offset = 0
 
-    while url:
-        data = _get(url, headers=spotify_headers(), params=params)
-        playlists.extend(data.get("items", []))
-        url    = data.get("next")   # next is al een volledige URL
-        params = None               # params zijn al in de next-URL verwerkt
-        log.info("Spotify: %d playlists opgehaald tot nu toe …", len(playlists))
+    while True:
+        data = _get(
+            f"{SPOTIFY_BASE}/me/playlists",
+            headers=spotify_headers(),
+            params={"limit": limit, "offset": offset},
+        )
+        items = data.get("items", [])
+        playlists.extend(items)
+        log.info(
+            "Spotify: %d/%d playlists opgehaald ...",
+            len(playlists),
+            data.get("total", "?"),
+        )
+
+        # Stop als er geen volgende pagina is of we alles hebben
+        if len(items) < limit or data.get("next") is None:
+            break
+        offset += limit
+        time.sleep(REQUEST_DELAY)
 
     return playlists
 
 
 def spotify_get_tracks_in_playlist(playlist_id: str) -> list[dict]:
-    """Haalt alle tracks van een playlist op, inclusief ISRC-codes."""
     tracks: list[dict] = []
-    url    = f"{SPOTIFY_BASE}/playlists/{playlist_id}/tracks"
-    params = {"limit": 100, "offset": 0,
-              "fields": "next,items(track(name,artists,external_ids))"}
+    url = f"{SPOTIFY_BASE}/playlists/{playlist_id}/tracks"
+    params: dict | None = {
+        "limit": 100,
+        "fields": "next,items(track(name,artists,external_ids))",
+    }
 
     while url:
         data = _get(url, headers=spotify_headers(), params=params)
         for item in data.get("items", []):
-            track = item.get("track")
-            if track:
-                tracks.append(track)
-        url    = data.get("next")
+            if item.get("track"):
+                tracks.append(item["track"])
+        url = data.get("next")
         params = None
 
     return tracks
 
 
 # ---------------------------------------------------------------------------
-# Tidal API-wrappers
+# Tidal API-wrappers (via tidalapi)
 # ---------------------------------------------------------------------------
 
-TIDAL_BASE = "https://openapi.tidal.com/v2"
 
-
-def tidal_search_by_isrc(isrc: str) -> str | None:
-    """Zoek een track op Tidal via ISRC. Geeft de Tidal track-ID terug of None."""
+def tidal_search_by_isrc(session: tidalapi.Session, isrc: str) -> int | None:
+    """Zoek een track via ISRC. Geeft Tidal track-ID (int) of None terug."""
     try:
-        data = _get(
-            f"{TIDAL_BASE}/tracks",
-            headers=tidal_headers(),
-            params={
-                "filter[isrc]":    isrc,
-                "countryCode":     TIDAL_COUNTRY_CODE,
-                "include":         "artists",
-            },
-        )
-        items = data.get("data", [])
-        if items:
-            return items[0]["id"]
-    except requests.HTTPError as exc:
-        log.debug("Tidal ISRC-zoekopdracht mislukt voor %s: %s", isrc, exc)
+        tracks = session.get_tracks_by_isrc(isrc)
+        if tracks:
+            return tracks[0].id
+    except Exception as exc:
+        log.debug("ISRC-zoekopdracht mislukt voor %s: %s", isrc, exc)
     return None
 
 
-def tidal_create_playlist(name: str, description: str = "") -> str:
-    """Maak een nieuwe Tidal-playlist aan en geef het ID terug."""
-    body = {
-        "data": {
-            "type": "playlists",
-            "attributes": {
-                "name":        name,
-                "description": description,
-                "privacy":     "PRIVATE",
-            },
-        }
-    }
-    data = _post(
-        f"{TIDAL_BASE}/users/{TIDAL_USER_ID}/playlists",
-        headers=tidal_headers(),
-        json_body=body,
-    )
-    playlist_id = data["data"]["id"]
-    log.info("Tidal-playlist aangemaakt: '%s' (id=%s)", name, playlist_id)
-    return playlist_id
+def tidal_create_playlist(
+    session: tidalapi.Session, name: str, description: str = ""
+) -> tidalapi.UserPlaylist:
+    playlist = session.user.create_playlist(name, description)
+    log.info("Tidal-playlist aangemaakt: '%s' (id=%s)", name, playlist.id)
+    return playlist
 
 
-def tidal_add_tracks_to_playlist(playlist_id: str, track_ids: list[str]) -> None:
-    """Voeg tracks toe aan een Tidal-playlist (maximaal 50 per keer)."""
-    # Tidal accepteert max 50 tracks per request
+def tidal_add_tracks(playlist: tidalapi.UserPlaylist, track_ids: list[int]) -> None:
     CHUNK_SIZE = 50
     for i in range(0, len(track_ids), CHUNK_SIZE):
         chunk = track_ids[i : i + CHUNK_SIZE]
-        body = {
-            "data": [
-                {"type": "tracks", "id": tid} for tid in chunk
-            ]
-        }
-        _post(
-            f"{TIDAL_BASE}/playlists/{playlist_id}/relationships/items",
-            headers=tidal_headers(),
-            json_body=body,
+        playlist.add(chunk)
+        log.info(
+            "  -> %d tracks toegevoegd (batch %d).", len(chunk), i // CHUNK_SIZE + 1
         )
-        log.info("  → %d tracks toegevoegd aan playlist %s (batch %d).",
-                 len(chunk), playlist_id, i // CHUNK_SIZE + 1)
+        time.sleep(REQUEST_DELAY)
 
 
 # ---------------------------------------------------------------------------
 # Hoofd-migratiefunctie
 # ---------------------------------------------------------------------------
 
-def migrate_playlists() -> None:
-    """Volledige migratie: Spotify → Tidal."""
 
-    # Valideer vereiste tokens
-    missing = []
-    for var in ("SPOTIFY_ACCESS_TOKEN", "TIDAL_ACCESS_TOKEN", "TIDAL_USER_ID"):
-        if not globals()[var]:
-            missing.append(var)
-    if missing:
+def migrate_playlists() -> None:
+    if not SPOTIFY_ACCESS_TOKEN:
         log.error(
-            "Ontbrekende omgevingsvariabelen: %s\n"
-            "Voer eerst `python sync_playlists.py --auth` uit.",
-            ", ".join(missing),
+            "SPOTIFY_ACCESS_TOKEN ontbreekt.\n"
+            "Voer eerst uit: python sync_playlists.py --auth-spotify"
         )
         sys.exit(1)
 
-    # ── Stap 1: Haal Spotify-playlists op ───────────────────────────────────
-    log.info("=== Stap 1: Spotify-playlists ophalen ===")
-    try:
-        user_id = spotify_get_current_user_id()
-    except requests.HTTPError:
-        log.info("Access-token verlopen, token vernieuwen …")
-        spotify_refresh_access_token()
-        user_id = spotify_get_current_user_id()
+    log.info("Tidal-sessie laden ...")
+    tidal_session = tidal_load_or_login()
 
-    playlists = spotify_get_all_playlists(user_id)
+    # Stap 1: Spotify playlists ophalen
+    log.info("=== Stap 1: Spotify-playlists ophalen ===")
+
+    # Controleer of het token nog geldig is via /me
+    try:
+        _get(f"{SPOTIFY_BASE}/me", headers=spotify_headers())
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 401:
+            log.info("Spotify-token verlopen, vernieuwen ...")
+            spotify_refresh_access_token()
+        else:
+            raise
+
+    playlists = spotify_get_all_playlists()
     log.info("Totaal %d playlists gevonden op Spotify.", len(playlists))
 
-    # Statistieken
-    total_tracks_found     = 0
-    total_tracks_not_found = 0
+    total_found = 0
+    total_not_found = 0
     not_found_log: list[str] = []
 
-    for pl_index, playlist in enumerate(playlists, start=1):
-        pl_name = playlist.get("name", f"Playlist {pl_index}")
-        pl_id   = playlist["id"]
-        log.info("\n── Playlist %d/%d: '%s' ──", pl_index, len(playlists), pl_name)
+    for idx, playlist in enumerate(playlists, start=1):
+        pl_name = playlist.get("name", f"Playlist {idx}")
+        pl_id = playlist["id"]
+        log.info("\n-- Playlist %d/%d: '%s' --", idx, len(playlists), pl_name)
 
-        # ── Stap 2: Maak Tidal-playlist aan ─────────────────────────────────
+        # Stap 2: Tidal playlist aanmaken
         try:
-            tidal_pl_id = tidal_create_playlist(
+            tidal_pl = tidal_create_playlist(
+                tidal_session,
                 name=pl_name,
                 description=f"Gemigreerd vanuit Spotify (id={pl_id})",
             )
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 401:
-                tidal_refresh_access_token()
-                tidal_pl_id = tidal_create_playlist(pl_name)
-            else:
-                log.error("Kan Tidal-playlist '%s' niet aanmaken: %s", pl_name, exc)
-                continue
+        except Exception as exc:
+            log.error("Kan Tidal-playlist '%s' niet aanmaken: %s", pl_name, exc)
+            continue
 
-        # ── Stap 3: Haal Spotify-tracks op ──────────────────────────────────
+        # Stap 3: Spotify tracks ophalen
         try:
             tracks = spotify_get_tracks_in_playlist(pl_id)
         except requests.HTTPError:
@@ -556,73 +421,71 @@ def migrate_playlists() -> None:
 
         log.info("  %d tracks gevonden in '%s'.", len(tracks), pl_name)
 
-        # ── Stap 3b: Zoek via ISRC op Tidal ─────────────────────────────────
-        tidal_track_ids: list[str] = []
+        # Stap 3b: ISRC opzoeken op Tidal
+        tidal_track_ids: list[int] = []
 
         for track in tracks:
-            track_name    = track.get("name", "Onbekend")
-            artists       = ", ".join(a["name"] for a in track.get("artists", []))
-            isrc          = track.get("external_ids", {}).get("isrc")
+            name = track.get("name", "Onbekend")
+            artists = ", ".join(a["name"] for a in track.get("artists", []))
+            isrc = track.get("external_ids", {}).get("isrc")
 
             if not isrc:
-                msg = f"Geen ISRC voor: '{track_name}' – {artists}"
-                log.warning("  ⚠  %s", msg)
+                msg = f"Geen ISRC: '{name}' - {artists}"
+                log.warning("  !  %s", msg)
                 not_found_log.append(msg)
-                total_tracks_not_found += 1
+                total_not_found += 1
                 continue
 
-            tidal_id = tidal_search_by_isrc(isrc)
+            tidal_id = tidal_search_by_isrc(tidal_session, isrc)
 
             if tidal_id:
                 tidal_track_ids.append(tidal_id)
-                total_tracks_found += 1
+                total_found += 1
             else:
-                msg = f"Niet gevonden op Tidal: '{track_name}' – {artists} (ISRC={isrc})"
-                log.warning("  ✗  %s", msg)
+                msg = f"Niet op Tidal: '{name}' - {artists} (ISRC={isrc})"
+                log.warning("  x  %s", msg)
                 not_found_log.append(msg)
-                total_tracks_not_found += 1
+                total_not_found += 1
 
-        # ── Stap 4: Voeg tracks toe aan Tidal-playlist ───────────────────────
+        # Stap 4: Tracks toevoegen
         if tidal_track_ids:
-            tidal_add_tracks_to_playlist(tidal_pl_id, tidal_track_ids)
-            log.info("  ✓  %d tracks toegevoegd aan '%s'.",
-                     len(tidal_track_ids), pl_name)
+            tidal_add_tracks(tidal_pl, tidal_track_ids)
+            log.info(
+                "  OK %d tracks toegevoegd aan '%s'.", len(tidal_track_ids), pl_name
+            )
         else:
-            log.info("  –  Geen tracks om toe te voegen voor '%s'.", pl_name)
+            log.info("  -  Geen tracks om toe te voegen voor '%s'.", pl_name)
 
-    # ── Eindrapport ──────────────────────────────────────────────────────────
-    log.info("\n=== Migratie voltooid ===")
-    log.info("Tracks gevonden en toegevoegd : %d", total_tracks_found)
-    log.info("Tracks NIET gevonden op Tidal : %d", total_tracks_not_found)
+        # Sessie periodiek opslaan
+        _tidal_save_session(tidal_session)
+
+    # Eindrapport
+    log.info("\n" + "=" * 50)
+    log.info("Migratie voltooid!")
+    log.info("Tracks toegevoegd : %d", total_found)
+    log.info("Niet gevonden     : %d", total_not_found)
 
     if not_found_log:
-        log.info("\nOntbrekende tracks (ook in sync_playlists.log):")
+        log.info("\nOntbrekende tracks:")
         for entry in not_found_log:
-            log.info("  • %s", entry)
+            log.info("  - %s", entry)
 
 
 # ---------------------------------------------------------------------------
-# CLI-entrypoint
+# CLI
 # ---------------------------------------------------------------------------
+
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Spotify → Tidal playlist-migratie"
+    parser = argparse.ArgumentParser(description="Spotify -> Tidal migratie")
+    parser.add_argument(
+        "--auth", action="store_true", help="Authenticeer bij Spotify en Tidal."
     )
     parser.add_argument(
-        "--auth",
-        action="store_true",
-        help="Voer de OAuth2-flow uit voor Spotify én Tidal en sla tokens op.",
+        "--auth-spotify", action="store_true", help="Authenticeer alleen bij Spotify."
     )
     parser.add_argument(
-        "--auth-spotify",
-        action="store_true",
-        help="Voer alleen de Spotify OAuth2-flow uit.",
-    )
-    parser.add_argument(
-        "--auth-tidal",
-        action="store_true",
-        help="Voer alleen de Tidal OAuth2-flow uit.",
+        "--auth-tidal", action="store_true", help="Authenticeer alleen bij Tidal."
     )
     args = parser.parse_args()
 
