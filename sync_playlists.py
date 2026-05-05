@@ -202,7 +202,7 @@ def tidal_load_or_login() -> tidalapi.Session:
     Laad een bestaande Tidal-sessie of start een nieuwe Device Flow login.
     De sessie wordt opgeslagen in tidal_session.pkl.
     """
-    session = tidalapi.Session()
+    session = tidalapi.Session(country_code=TIDAL_COUNTRY_CODE)
 
     if os.path.exists(TIDAL_SESSION_FILE):
         try:
@@ -231,7 +231,7 @@ def tidal_authorize(session: tidalapi.Session | None = None) -> tidalapi.Session
     link.tidal.com en voert een code in.
     """
     if session is None:
-        session = tidalapi.Session()
+        session = tidalapi.Session(country_code=TIDAL_COUNTRY_CODE)
 
     print("\n" + "=" * 60)
     print("TIDAL - Device Flow login (geen redirect URI nodig)")
@@ -311,7 +311,8 @@ def spotify_get_tracks_in_playlist(playlist_id: str) -> list[dict]:
     url = f"{SPOTIFY_BASE}/playlists/{playlist_id}/tracks"
     params: dict | None = {
         "limit": 100,
-        "fields": "next,items(track(name,artists,external_ids))",
+        "market": "from_token",
+        "fields": "next,items(track(name,artists(name),external_ids(isrc)))",
     }
 
     while url:
@@ -323,6 +324,19 @@ def spotify_get_tracks_in_playlist(playlist_id: str) -> list[dict]:
         params = None
 
     return tracks
+
+
+def tidal_search_by_query(
+    session: tidalapi.Session, name: str, artists: str
+) -> int | None:
+    query = f"{name} {artists}"
+    try:
+        results = session.search(query, models=[tidalapi.Track])
+        if results and results["tracks"]:
+            return results["tracks"][0].id
+    except Exception as exc:
+        log.debug("Zoekopdracht mislukt voor %s: %s", query, exc)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -436,7 +450,15 @@ def migrate_playlists() -> None:
                 total_not_found += 1
                 continue
 
-            tidal_id = tidal_search_by_isrc(tidal_session, isrc)
+            tidal_id = None
+
+            if isrc:
+                tidal_id = tidal_search_by_isrc(tidal_session, isrc)
+
+            # fallback als ISRC faalt
+            if not tidal_id:
+                tidal_id = tidal_search_by_query(tidal_session, name, artists)
+                log.info("  → Match: %s - %s -> %s", name, artists, tidal_id)
 
             if tidal_id:
                 tidal_track_ids.append(tidal_id)
