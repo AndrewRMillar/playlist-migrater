@@ -1,3 +1,5 @@
 .env
 tidal_session.pkl
+track_cache.pkl
 sync_playlists.log
+.venv/

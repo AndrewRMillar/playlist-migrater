@@ -1,164 +1,180 @@
-# Spotify → Tidal Playlist Migrator
+# Spotify to Tidal Playlist Migrator
 
-Migreert al jouw Spotify-afspeellijsten naar Tidal via ISRC-matching.
+Migrates all your Spotify playlists to Tidal using ISRC-based track matching, with a text-search fallback for tracks without an ISRC.
 
 ---
 
-## Vereisten
+## Requirements
 
-| Vereiste | Versie |
+| Requirement | Version |
 |---|---|
-| Python | 3.10 of hoger |
-| Ubuntu | 20.04+ (of een andere moderne Linux-distro) |
+| Python | 3.10 or higher |
+| Ubuntu | 20.04+ (or any modern Linux distro) |
 
 ---
 
-## Stap 1 – Spotify Developer App aanmaken
+## Step 1 – Create a Spotify Developer App
 
-1. Ga naar <https://developer.spotify.com/dashboard> en log in.
-2. Klik op **"Create app"**.
-3. Vul in:
-   - **App name**: bijv. `Playlist Migrator`
-   - **App description**: naar keuze
-   - **Redirect URI**: `http://localhost:8888/callback`  
-     _(klik op "Add" en sla op)_
-4. Selecteer **Web API** als API-gebruik.
-5. Klik op **Save**.
-6. Open de app en kopieer de **Client ID** en **Client Secret** (via "View client secret").
+1. Go to <https://developer.spotify.com/dashboard> and log in.
+2. Click **"Create app"**.
+3. Fill in:
+   - **App name**: e.g. `Playlist Migrator`
+   - **Redirect URI**: `http://127.0.0.1:8888/callback` — click **Add**, then **Save**
+4. Select **Web API** as the API type.
+5. Open the app settings and copy the **Client ID** and **Client Secret**.
 
-**Benodigde scopes:**
+**Required scopes** (requested automatically during auth):
 - `playlist-read-private`
 - `playlist-read-collaborative`
 
-> De scopes worden automatisch aangevraagd tijdens de OAuth2-flow.
-
 ---
 
-## Stap 2 – Tidal Developer App aanmaken
+## Step 2 – Create a Tidal Developer App
 
-1. Ga naar <https://developer.tidal.com/> en log in met je Tidal-account.
-2. Klik op **"New Application"**.
-3. Vul in:
-   - **Application Name**: bijv. `Playlist Migrator`
-   - **Redirect URI**: `http://localhost:8889/callback`
-4. Stel bij **Permissions** (scopes) in:
+1. Go to <https://developer.tidal.com/> and log in with your Tidal account.
+2. Click **"New Application"**.
+3. Fill in:
+   - **Application Name**: e.g. `Playlist Migrator`
+   - **Redirect URI**: `http://127.0.0.1:8889/callback`
+4. Enable these **scopes**:
    - `playlists.read`
    - `playlists.write`
    - `user.read`
-5. Klik op **Save** en kopieer de **Client ID** en **Client Secret**.
+5. Save and copy the **Client ID** and **Client Secret**.
 
-> **Let op:** De Tidal OpenAPI (`openapi.tidal.com/v2`) is beschikbaar via  
-> het **"TIDAL API"**-programma. Zorg dat je applicatie hiervoor is  
-> goedgekeurd. Bij twijfel: start een verzoek via het developer-portaal.
+> **Note:** Tidal authentication uses the **Device Flow** — no redirect URI handling is needed at runtime. The script opens `link.tidal.com` in your browser where you log in directly.
 
 ---
 
-## Stap 3 – Installatie op Ubuntu
+## Step 3 – Installation
 
 ```bash
-# 1. Kloon of kopieer de projectmap
+# Clone or copy the project folder
 cd ~/playlist-migrator
 
-# 2. Maak een virtual environment aan
+# Create a virtual environment
 python3 -m venv .venv
 source .venv/bin/activate
 
-# 3. Installeer dependencies
+# Install dependencies
 pip install -r requirements.txt
 
-# 4. Maak .env aan op basis van het voorbeeld
+# Create .env from the example
 cp .env.example .env
 ```
 
-Open `.env` in een editor en vul je **Client ID's** en **Client Secrets** in voor
-zowel Spotify als Tidal. Laat de token-velden voorlopig leeg.
+Open `.env` and fill in your **Client ID** and **Client Secret** for both Spotify and Tidal. Leave the token fields empty for now.
 
 ---
 
-## Stap 4 – Authenticatie (eenmalig)
+## Step 4 – Authentication (one-time)
 
+**Spotify:**
+```bash
+python sync_playlists.py --auth-spotify
+```
+The script opens the Spotify authorization page. After granting access, Spotify redirects you to a URL that cannot be reached — copy the full URL from your browser address bar and paste it into the terminal.
+
+**Tidal:**
+```bash
+python sync_playlists.py --auth-tidal
+```
+The script opens `link.tidal.com` in your browser. Log in with your Tidal account. The script waits automatically and continues once login is complete.
+
+**Or authenticate with both at once:**
 ```bash
 python sync_playlists.py --auth
 ```
 
-Het script:
-1. Opent de Spotify-autorisatiepagina in je browser.
-2. Nadat je akkoord gaat, vangt het lokaal de callback op poort **8888** op.
-3. Herhaalt dit voor Tidal op poort **8889**.
-4. Slaat alle tokens op in `.env`.
-
-> **Werkt de browser niet automatisch?** Kopieer de URL die in de terminal
-> verschijnt en plak die handmatig in je browser.
-
-Je kunt ook afzonderlijk authenticeren:
-
-```bash
-python sync_playlists.py --auth-spotify   # alleen Spotify
-python sync_playlists.py --auth-tidal     # alleen Tidal
-```
+Tokens are saved locally (`tidal_session.pkl` and `.env`) and reused on subsequent runs.
 
 ---
 
-## Stap 5 – Migratie starten
+## Step 5 – Run the migration
 
 ```bash
 python sync_playlists.py
 ```
 
-De voortgang wordt live getoond én weggeschreven naar `sync_playlists.log`.
+Progress is shown in the terminal and written to `sync_playlists.log`.
 
-### Voorbeeld output
+### Example output
 
 ```
-2025-01-15 14:32:01 [INFO] === Stap 1: Spotify-playlists ophalen ===
-2025-01-15 14:32:02 [INFO] Totaal 12 playlists gevonden op Spotify.
-2025-01-15 14:32:02 [INFO] ── Playlist 1/12: 'Mijn favorieten' ──
-2025-01-15 14:32:02 [INFO] Tidal-playlist aangemaakt: 'Mijn favorieten' (id=abc123)
-2025-01-15 14:32:03 [INFO]   42 tracks gevonden in 'Mijn favorieten'.
-2025-01-15 14:32:15 [WARNING]   ✗  Niet gevonden op Tidal: 'Rare Track' – Artiest (ISRC=USRC12345678)
-2025-01-15 14:32:16 [INFO]   ✓  41 tracks toegevoegd aan 'Mijn favorieten'.
+2026-05-06 12:03:01,000 [INFO] Tidal session loaded from tidal_session.pkl.
+2026-05-06 12:03:01,500 [INFO] Logged in as Spotify user: 1139266769
+2026-05-06 12:03:02,000 [INFO] Spotify: 50/55 playlists fetched ...
+2026-05-06 12:03:02,500 [INFO] Spotify: 55/55 playlists fetched ...
+2026-05-06 12:03:02,500 [INFO] Found 55 playlists on Spotify.
+
+-- Playlist 1/55: 'Radiohead' (owner: 1139266769) --
+2026-05-06 12:03:03,000 [INFO]   8 tracks found.
+2026-05-06 12:03:03,100 [INFO]   New Tidal playlist created (id=abc123).
+2026-05-06 12:03:03,200 [INFO]   + Creep - Radiohead
+2026-05-06 12:03:03,400 [WARNING]   x Not found: 'Rare B-side' - Radiohead (ISRC=GBUM71234567)
+2026-05-06 12:03:04,000 [INFO]   -> Batch 1: 7 tracks added.
+2026-05-06 12:03:04,000 [INFO]   OK: 7/8 tracks added to 'Radiohead'.
 ...
-2025-01-15 14:45:00 [INFO] === Migratie voltooid ===
-2025-01-15 14:45:00 [INFO] Tracks gevonden en toegevoegd : 387
-2025-01-15 14:45:00 [INFO] Tracks NIET gevonden op Tidal : 23
+==================================================
+2026-05-06 12:45:00,000 [INFO] Migration complete!
+2026-05-06 12:45:00,000 [INFO] Tracks found    : 412
+2026-05-06 12:45:00,000 [INFO] Tracks not found: 18
 ```
 
 ---
 
-## Veelgestelde vragen
+## Behaviour
 
-**Wat gebeurt er met tracks die niet op Tidal staan?**  
-Ze worden gelogd in de terminal en in `sync_playlists.log`. De playlist
-wordt gewoon aangemaakt met de tracks die wél gevonden zijn.
+**Existing Tidal playlists**
+If a Tidal playlist with the same name already exists, it is cleared and repopulated. Running the script multiple times will not create duplicate playlists.
 
-**Kan ik het script opnieuw draaien?**  
-Ja, maar het script controleert niet op duplicaten — er worden dan nieuwe
-playlists aangemaakt naast de bestaande. Verwijder de Tidal-playlists
-handmatig vóór een herstart als je dat wilt vermijden.
+**Followed playlists**
+Playlists you follow from other Spotify users are skipped with a warning — Spotify's API does not allow fetching tracks from playlists you do not own.
 
-**Mijn token is verlopen.**  
-Het script vernieuwt het access-token automatisch met het refresh-token.
-Als ook dat verlopen is, voer dan opnieuw `--auth` uit.
+**Track matching**
+Tracks are matched in order of reliability:
+1. **Cache** — tracks already looked up in a previous run are reused instantly
+2. **ISRC** — the International Standard Recording Code gives an exact match
+3. **Text search** — fallback using track name + artist name if no ISRC is available
 
-**Ik krijg een 403 van Tidal.**  
-Controleer of de scopes `playlists.write` en `user.read` correct zijn
-ingesteld in je Tidal Developer App. Een nieuwe `--auth-tidal` is daarna nodig.
+Tracks not found on Tidal are logged to both the terminal and `sync_playlists.log`.
+
+**Re-running the script**
+Safe to re-run at any time. The local cache (`track_cache.pkl`) ensures already-matched tracks are not looked up again, which speeds up subsequent runs significantly.
 
 ---
 
-## Projectstructuur
+## Project structure
 
 ```
 playlist-migrator/
-├── sync_playlists.py   # Hoofdscript
-├── requirements.txt    # Python-afhankelijkheden
-├── .env.example        # Voorbeeld omgevingsbestand
-├── .env                # Jouw credentials (nooit committen!)
-└── sync_playlists.log  # Automatisch aangemaakt bij uitvoer
+├── sync_playlists.py     # Main script
+├── requirements.txt      # Python dependencies
+├── .env.example          # Example environment file
+├── .env                  # Your credentials (never commit this)
+├── tidal_session.pkl     # Saved Tidal session (auto-generated)
+├── track_cache.pkl       # Track lookup cache (auto-generated)
+└── sync_playlists.log    # Migration log (auto-generated)
 ```
 
 ---
 
-## Licentie
+## Troubleshooting
 
-MIT – vrij te gebruiken en aan te passen.
+**Spotify 401 Unauthorized**
+Your access token has expired. Run `--auth-spotify` again to get a fresh token.
+
+**Spotify 403 Forbidden on a playlist**
+The playlist is owned by another user (a followed playlist). These are skipped automatically.
+
+**Tidal login prompt on every run**
+The `tidal_session.pkl` file is missing or corrupted. Run `--auth-tidal` to create a fresh session.
+
+**Many tracks not found on Tidal**
+Some tracks may not be available in your country (`TIDAL_COUNTRY_CODE` in `.env`). Try changing the country code, or check if the tracks exist on Tidal manually.
+
+---
+
+## License
+
+MIT — free to use and modify.
