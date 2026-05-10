@@ -20,12 +20,12 @@ import pickle
 import sys
 import time
 import webbrowser
+from dataclasses import dataclass, field
 from urllib.parse import parse_qs, urlencode, urlparse
 
 import requests
 import tidalapi
 from dotenv import load_dotenv, set_key
-from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # Configuration & logging
@@ -485,12 +485,41 @@ def _resolve_tracks(
 def _push_tracks_to_tidal(
     tidal_pl: tidalapi.UserPlaylist, tidal_ids: list[int]
 ) -> None:
-    """Add tracks to a Tidal playlist in batches of 50."""
+    """Add tracks to a Tidal playlist in batches of 50.
+
+    Retries on 412 (ETag conflict) by re-fetching the playlist object,
+    which forces tidalapi to pick up the latest ETag before retrying.
+    """
     for i in range(0, len(tidal_ids), 50):
         chunk = tidal_ids[i : i + 50]
-        tidal_pl.add(chunk)
-        log.info("  -> Batch %d: %d tracks added.", i // 50 + 1, len(chunk))
-        time.sleep(REQUEST_DELAY)
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                tidal_pl.add(chunk)
+                log.info("  -> Batch %d: %d tracks added.", i // 50 + 1, len(chunk))
+                time.sleep(REQUEST_DELAY)
+                break
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 412:
+                    wait = RETRY_AFTER_DEFAULT * attempt
+                    log.warning(
+                        "  412 ETag conflict on batch %d (attempt %d/%d). "
+                        "Waiting %ds ...",
+                        i // 50 + 1,
+                        attempt,
+                        MAX_RETRIES,
+                        wait,
+                    )
+                    time.sleep(wait)
+                    # Re-fetch playlist so tidalapi gets the updated ETag
+                    tidal_pl = tidal_pl.session.playlist(tidal_pl.id)
+                else:
+                    raise
+        else:
+            log.error(
+                "  Batch %d failed after %d attempts, skipping.",
+                i // 50 + 1,
+                MAX_RETRIES,
+            )
 
 
 def _migrate_playlist(
