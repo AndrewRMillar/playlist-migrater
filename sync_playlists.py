@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlencode, urlparse
 import requests
 import tidalapi
 from dotenv import load_dotenv, set_key
+from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
 # Configuration & logging
@@ -42,25 +43,28 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-SPOTIFY_CLIENT_ID     = os.getenv("SPOTIFY_CLIENT_ID", "")
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
-SPOTIFY_REDIRECT_URI  = os.getenv("SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback")
-SPOTIFY_ACCESS_TOKEN  = os.getenv("SPOTIFY_ACCESS_TOKEN", "")
+SPOTIFY_REDIRECT_URI = os.getenv(
+    "SPOTIFY_REDIRECT_URI", "http://127.0.0.1:8888/callback"
+)
+SPOTIFY_ACCESS_TOKEN = os.getenv("SPOTIFY_ACCESS_TOKEN", "")
 SPOTIFY_REFRESH_TOKEN = os.getenv("SPOTIFY_REFRESH_TOKEN", "")
 
 TIDAL_SESSION_FILE = "tidal_session.pkl"
 TIDAL_COUNTRY_CODE = os.getenv("TIDAL_COUNTRY_CODE", "NL")
-TRACK_CACHE_FILE   = "track_cache.pkl"
+TRACK_CACHE_FILE = "track_cache.pkl"
 
-REQUEST_DELAY       = 0.3   # seconds between API calls
-RETRY_AFTER_DEFAULT = 5     # seconds to wait when Retry-After header is missing
-MAX_RETRIES         = 5
-ENV_FILE            = ".env"
-SPOTIFY_BASE        = "https://api.spotify.com/v1"
+REQUEST_DELAY = 0.3  # seconds between API calls
+RETRY_AFTER_DEFAULT = 5  # seconds to wait when Retry-After header is missing
+MAX_RETRIES = 5
+ENV_FILE = ".env"
+SPOTIFY_BASE = "https://api.spotify.com/v1"
 
 # ---------------------------------------------------------------------------
 # Generic HTTP helper
 # ---------------------------------------------------------------------------
+
 
 def _get(url: str, headers: dict, params: dict | None = None) -> dict:
     """GET with automatic retry on 429 (rate limit) and 5xx (server error)."""
@@ -73,8 +77,13 @@ def _get(url: str, headers: dict, params: dict | None = None) -> dict:
             continue
         if resp.status_code in (500, 502, 503, 504):
             wait = RETRY_AFTER_DEFAULT * attempt
-            log.warning("Server error %d (attempt %d/%d). Waiting %ds ...",
-                        resp.status_code, attempt, MAX_RETRIES, wait)
+            log.warning(
+                "Server error %d (attempt %d/%d). Waiting %ds ...",
+                resp.status_code,
+                attempt,
+                MAX_RETRIES,
+                wait,
+            )
             time.sleep(wait)
             continue
         resp.raise_for_status()
@@ -82,13 +91,14 @@ def _get(url: str, headers: dict, params: dict | None = None) -> dict:
         return resp.json()
     raise RuntimeError(f"GET {url} failed after {MAX_RETRIES} attempts.")
 
+
 # ---------------------------------------------------------------------------
 # Spotify OAuth2 – Authorization Code Flow (copy-paste)
 # ---------------------------------------------------------------------------
 
-SPOTIFY_AUTH_URL  = "https://accounts.spotify.com/authorize"
+SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-SPOTIFY_SCOPES    = "playlist-read-private playlist-read-collaborative"
+SPOTIFY_SCOPES = "playlist-read-private playlist-read-collaborative"
 
 
 def spotify_headers() -> dict:
@@ -103,9 +113,9 @@ def spotify_refresh_access_token() -> None:
     resp = requests.post(
         SPOTIFY_TOKEN_URL,
         data={
-            "grant_type":    "refresh_token",
+            "grant_type": "refresh_token",
             "refresh_token": os.getenv("SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN),
-            "client_id":     SPOTIFY_CLIENT_ID,
+            "client_id": SPOTIFY_CLIENT_ID,
             "client_secret": SPOTIFY_CLIENT_SECRET,
         },
         timeout=15,
@@ -126,10 +136,10 @@ def spotify_authorize() -> None:
     global SPOTIFY_ACCESS_TOKEN, SPOTIFY_REFRESH_TOKEN
 
     params = {
-        "client_id":     SPOTIFY_CLIENT_ID,
+        "client_id": SPOTIFY_CLIENT_ID,
         "response_type": "code",
-        "redirect_uri":  SPOTIFY_REDIRECT_URI,
-        "scope":         SPOTIFY_SCOPES,
+        "redirect_uri": SPOTIFY_REDIRECT_URI,
+        "scope": SPOTIFY_SCOPES,
     }
     auth_url = SPOTIFY_AUTH_URL + "?" + urlencode(params)
 
@@ -154,28 +164,32 @@ def spotify_authorize() -> None:
     resp = requests.post(
         SPOTIFY_TOKEN_URL,
         data={
-            "grant_type":    "authorization_code",
-            "code":          qs["code"][0],
-            "redirect_uri":  SPOTIFY_REDIRECT_URI,
-            "client_id":     SPOTIFY_CLIENT_ID,
+            "grant_type": "authorization_code",
+            "code": qs["code"][0],
+            "redirect_uri": SPOTIFY_REDIRECT_URI,
+            "client_id": SPOTIFY_CLIENT_ID,
             "client_secret": SPOTIFY_CLIENT_SECRET,
         },
         timeout=15,
     )
     resp.raise_for_status()
     tokens = resp.json()
-    SPOTIFY_ACCESS_TOKEN  = tokens["access_token"]
+    SPOTIFY_ACCESS_TOKEN = tokens["access_token"]
     SPOTIFY_REFRESH_TOKEN = tokens.get("refresh_token", SPOTIFY_REFRESH_TOKEN)
 
-    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN",  SPOTIFY_ACCESS_TOKEN, quote_mode="never")
-    set_key(ENV_FILE, "SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN, quote_mode="never")
-    os.environ["SPOTIFY_ACCESS_TOKEN"]  = SPOTIFY_ACCESS_TOKEN
+    set_key(ENV_FILE, "SPOTIFY_ACCESS_TOKEN", SPOTIFY_ACCESS_TOKEN, quote_mode="never")
+    set_key(
+        ENV_FILE, "SPOTIFY_REFRESH_TOKEN", SPOTIFY_REFRESH_TOKEN, quote_mode="never"
+    )
+    os.environ["SPOTIFY_ACCESS_TOKEN"] = SPOTIFY_ACCESS_TOKEN
     os.environ["SPOTIFY_REFRESH_TOKEN"] = SPOTIFY_REFRESH_TOKEN
     log.info("Spotify tokens saved.")
+
 
 # ---------------------------------------------------------------------------
 # Tidal OAuth2 – Device Flow via tidalapi (no redirect URI needed)
 # ---------------------------------------------------------------------------
+
 
 def tidal_load_or_login() -> tidalapi.Session:
     """Load a saved Tidal session or start a new Device Flow login."""
@@ -229,16 +243,21 @@ def tidal_authorize(session: tidalapi.Session | None = None) -> tidalapi.Session
 def _tidal_save_session(session: tidalapi.Session) -> None:
     """Persist Tidal OAuth tokens to disk as a pickle file."""
     with open(TIDAL_SESSION_FILE, "wb") as f:
-        pickle.dump({
-            "token_type":    session.token_type,
-            "access_token":  session.access_token,
-            "refresh_token": session.refresh_token,
-            "expiry_time":   session.expiry_time,
-        }, f)
+        pickle.dump(
+            {
+                "token_type": session.token_type,
+                "access_token": session.access_token,
+                "refresh_token": session.refresh_token,
+                "expiry_time": session.expiry_time,
+            },
+            f,
+        )
+
 
 # ---------------------------------------------------------------------------
 # Track cache – avoids repeated Tidal lookups across runs
 # ---------------------------------------------------------------------------
+
 
 def load_cache() -> dict:
     if os.path.exists(TRACK_CACHE_FILE):
@@ -254,9 +273,11 @@ def save_cache(cache: dict) -> None:
     with open(TRACK_CACHE_FILE, "wb") as f:
         pickle.dump(cache, f)
 
+
 # ---------------------------------------------------------------------------
 # Spotify API
 # ---------------------------------------------------------------------------
+
 
 def spotify_check_and_refresh() -> None:
     """Check token validity via /me and refresh if a 401 is returned."""
@@ -278,7 +299,7 @@ def spotify_get_current_user_id() -> str:
 def spotify_get_all_playlists() -> list[dict]:
     """Fetch all playlists of the authenticated user, handling pagination."""
     playlists: list[dict] = []
-    limit  = 50
+    limit = 50
     offset = 0
 
     while True:
@@ -289,8 +310,11 @@ def spotify_get_all_playlists() -> list[dict]:
         )
         items = data.get("items", [])
         playlists.extend(items)
-        log.info("Spotify: %d/%d playlists fetched ...",
-                 len(playlists), data.get("total", "?"))
+        log.info(
+            "Spotify: %d/%d playlists fetched ...",
+            len(playlists),
+            data.get("total", "?"),
+        )
         if len(items) < limit or not data.get("next"):
             break
         offset += limit
@@ -305,7 +329,7 @@ def spotify_get_tracks_in_playlist(playlist_id: str) -> list[dict]:
     Skips null items (deleted tracks) and non-track items (e.g. podcast episodes).
     """
     tracks: list[dict] = []
-    limit  = 100
+    limit = 100
     offset = 0
 
     while True:
@@ -329,22 +353,22 @@ def spotify_get_tracks_in_playlist(playlist_id: str) -> list[dict]:
 
     return tracks
 
+
 # ---------------------------------------------------------------------------
 # Tidal search with cache and text-search fallback
 # ---------------------------------------------------------------------------
 
-def search_tidal(session: tidalapi.Session,
-                 isrc: str | None,
-                 name: str,
-                 artists: str,
-                 cache: dict) -> int | None:
+
+def search_tidal(
+    session: tidalapi.Session, isrc: str | None, name: str, artists: str, cache: dict
+) -> int | None:
     """
     Search for a track on Tidal:
     1. Check local cache
     2. ISRC lookup (most accurate)
     3. Fallback: text search on track name + artist
     """
-    cache_key_isrc  = f"isrc:{isrc}" if isrc else None
+    cache_key_isrc = f"isrc:{isrc}" if isrc else None
     cache_key_query = f"q:{name}-{artists}"
 
     # 1. Cache
@@ -366,9 +390,9 @@ def search_tidal(session: tidalapi.Session,
 
     # 3. Text search fallback
     try:
-        query   = f"{name} {artists}"
+        query = f"{name} {artists}"
         results = session.search(query, models=[tidalapi.media.Track])
-        tracks  = results.get("tracks", [])
+        tracks = results.get("tracks", [])
         if tracks:
             tidal_id = tracks[0].id
             cache[cache_key_query] = tidal_id
@@ -382,16 +406,15 @@ def search_tidal(session: tidalapi.Session,
     cache[cache_key_query] = None
     return None
 
+
 # ---------------------------------------------------------------------------
 # Migration
 # ---------------------------------------------------------------------------
 
-from dataclasses import dataclass, field
-
 
 @dataclass
 class MigrationStats:
-    found:     int = 0
+    found: int = 0
     not_found: int = 0
     not_found_log: list[str] = field(default_factory=list)
 
@@ -413,9 +436,9 @@ class MigrationStats:
                 log.info("  - %s", entry)
 
 
-def _get_or_create_tidal_playlist(tidal_session: tidalapi.Session,
-                                   name: str,
-                                   spotify_id: str) -> tidalapi.UserPlaylist:
+def _get_or_create_tidal_playlist(
+    tidal_session: tidalapi.Session, name: str, spotify_id: str
+) -> tidalapi.UserPlaylist:
     """Return an empty Tidal playlist: clear an existing one or create a new one."""
     existing = [p for p in tidal_session.user.playlists() if p.name == name]
     if existing:
@@ -433,16 +456,18 @@ def _get_or_create_tidal_playlist(tidal_session: tidalapi.Session,
     return tidal_pl
 
 
-def _resolve_tracks(tidal_session: tidalapi.Session,
-                    tracks: list[dict],
-                    cache: dict,
-                    stats: MigrationStats) -> list[int]:
+def _resolve_tracks(
+    tidal_session: tidalapi.Session,
+    tracks: list[dict],
+    cache: dict,
+    stats: MigrationStats,
+) -> list[int]:
     """Look up each Spotify track on Tidal. Returns a deduplicated list of Tidal IDs."""
     tidal_ids: list[int] = []
     for track in tracks:
-        name    = track.get("name", "Unknown")
+        name = track.get("name", "Unknown")
         artists = ", ".join(a["name"] for a in track.get("artists", []))
-        isrc    = track.get("external_ids", {}).get("isrc")
+        isrc = track.get("external_ids", {}).get("isrc")
 
         tidal_id = search_tidal(tidal_session, isrc, name, artists, cache)
         if tidal_id:
@@ -457,8 +482,9 @@ def _resolve_tracks(tidal_session: tidalapi.Session,
     return list(dict.fromkeys(tidal_ids))  # deduplicate, preserve order
 
 
-def _push_tracks_to_tidal(tidal_pl: tidalapi.UserPlaylist,
-                           tidal_ids: list[int]) -> None:
+def _push_tracks_to_tidal(
+    tidal_pl: tidalapi.UserPlaylist, tidal_ids: list[int]
+) -> None:
     """Add tracks to a Tidal playlist in batches of 50."""
     for i in range(0, len(tidal_ids), 50):
         chunk = tidal_ids[i : i + 50]
@@ -467,15 +493,17 @@ def _push_tracks_to_tidal(tidal_pl: tidalapi.UserPlaylist,
         time.sleep(REQUEST_DELAY)
 
 
-def _migrate_playlist(playlist: dict,
-                      idx: int,
-                      total: int,
-                      tidal_session: tidalapi.Session,
-                      cache: dict,
-                      stats: MigrationStats) -> None:
+def _migrate_playlist(
+    playlist: dict,
+    idx: int,
+    total: int,
+    tidal_session: tidalapi.Session,
+    cache: dict,
+    stats: MigrationStats,
+) -> None:
     """Migrate a single Spotify playlist to Tidal."""
-    name     = playlist.get("name", f"Playlist {idx}")
-    pl_id    = playlist.get("id")
+    name = playlist.get("name", f"Playlist {idx}")
+    pl_id = playlist.get("id")
     owner_id = playlist.get("owner", {}).get("id", "")
 
     log.info("\n-- Playlist %d/%d: '%s' (owner: %s) --", idx, total, name, owner_id)
@@ -484,8 +512,11 @@ def _migrate_playlist(playlist: dict,
         tracks = spotify_get_tracks_in_playlist(pl_id)
     except requests.HTTPError as exc:
         if exc.response is not None and exc.response.status_code == 403:
-            log.warning("  Skipped: no access to '%s' (followed playlist of '%s').",
-                        name, owner_id)
+            log.warning(
+                "  Skipped: no access to '%s' (followed playlist of '%s').",
+                name,
+                owner_id,
+            )
         else:
             log.error("  Error fetching tracks of '%s': %s", name, exc)
         return
@@ -517,8 +548,8 @@ def migrate_playlists() -> None:
         sys.exit(1)
 
     tidal_session = tidal_load_or_login()
-    cache         = load_cache()
-    stats         = MigrationStats()
+    cache = load_cache()
+    stats = MigrationStats()
 
     spotify_check_and_refresh()
     log.info("Logged in as Spotify user: %s", spotify_get_current_user_id())
@@ -535,18 +566,23 @@ def migrate_playlists() -> None:
 
     stats.log_summary()
 
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Spotify -> Tidal playlist migration")
-    parser.add_argument("--auth",         action="store_true",
-                        help="Authenticate with both Spotify and Tidal.")
-    parser.add_argument("--auth-spotify", action="store_true",
-                        help="Authenticate with Spotify only.")
-    parser.add_argument("--auth-tidal",   action="store_true",
-                        help="Authenticate with Tidal only.")
+    parser.add_argument(
+        "--auth", action="store_true", help="Authenticate with both Spotify and Tidal."
+    )
+    parser.add_argument(
+        "--auth-spotify", action="store_true", help="Authenticate with Spotify only."
+    )
+    parser.add_argument(
+        "--auth-tidal", action="store_true", help="Authenticate with Tidal only."
+    )
     args = parser.parse_args()
 
     if args.auth or args.auth_spotify:
