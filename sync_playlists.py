@@ -386,120 +386,154 @@ def search_tidal(session: tidalapi.Session,
 # Migration
 # ---------------------------------------------------------------------------
 
+from dataclasses import dataclass, field
+
+
+@dataclass
+class MigrationStats:
+    found:     int = 0
+    not_found: int = 0
+    not_found_log: list[str] = field(default_factory=list)
+
+    def record_found(self) -> None:
+        self.found += 1
+
+    def record_missing(self, label: str) -> None:
+        self.not_found += 1
+        self.not_found_log.append(label)
+
+    def log_summary(self) -> None:
+        log.info("\n" + "=" * 50)
+        log.info("Migration complete!")
+        log.info("Tracks found    : %d", self.found)
+        log.info("Tracks not found: %d", self.not_found)
+        if self.not_found_log:
+            log.info("\nNot found:")
+            for entry in self.not_found_log:
+                log.info("  - %s", entry)
+
+
+def _get_or_create_tidal_playlist(tidal_session: tidalapi.Session,
+                                   name: str,
+                                   spotify_id: str) -> tidalapi.UserPlaylist:
+    """Return an empty Tidal playlist: clear an existing one or create a new one."""
+    existing = [p for p in tidal_session.user.playlists() if p.name == name]
+    if existing:
+        tidal_pl = existing[0]
+        log.info("  Existing Tidal playlist found (id=%s), clearing ...", tidal_pl.id)
+        current = tidal_pl.tracks()
+        if current:
+            tidal_pl.remove_by_indices(list(range(len(current))))
+        log.info("  Playlist cleared (%d tracks removed).", len(current))
+    else:
+        tidal_pl = tidal_session.user.create_playlist(
+            name, f"Migrated from Spotify ({spotify_id})"
+        )
+        log.info("  New Tidal playlist created (id=%s).", tidal_pl.id)
+    return tidal_pl
+
+
+def _resolve_tracks(tidal_session: tidalapi.Session,
+                    tracks: list[dict],
+                    cache: dict,
+                    stats: MigrationStats) -> list[int]:
+    """Look up each Spotify track on Tidal. Returns a deduplicated list of Tidal IDs."""
+    tidal_ids: list[int] = []
+    for track in tracks:
+        name    = track.get("name", "Unknown")
+        artists = ", ".join(a["name"] for a in track.get("artists", []))
+        isrc    = track.get("external_ids", {}).get("isrc")
+
+        tidal_id = search_tidal(tidal_session, isrc, name, artists, cache)
+        if tidal_id:
+            tidal_ids.append(tidal_id)
+            stats.record_found()
+            log.info("  + %s - %s", name, artists)
+        else:
+            label = f"Not found: '{name}' - {artists} (ISRC={isrc})"
+            log.warning("  x %s", label)
+            stats.record_missing(label)
+
+    return list(dict.fromkeys(tidal_ids))  # deduplicate, preserve order
+
+
+def _push_tracks_to_tidal(tidal_pl: tidalapi.UserPlaylist,
+                           tidal_ids: list[int]) -> None:
+    """Add tracks to a Tidal playlist in batches of 50."""
+    for i in range(0, len(tidal_ids), 50):
+        chunk = tidal_ids[i : i + 50]
+        tidal_pl.add(chunk)
+        log.info("  -> Batch %d: %d tracks added.", i // 50 + 1, len(chunk))
+        time.sleep(REQUEST_DELAY)
+
+
+def _migrate_playlist(playlist: dict,
+                      idx: int,
+                      total: int,
+                      tidal_session: tidalapi.Session,
+                      cache: dict,
+                      stats: MigrationStats) -> None:
+    """Migrate a single Spotify playlist to Tidal."""
+    name     = playlist.get("name", f"Playlist {idx}")
+    pl_id    = playlist.get("id")
+    owner_id = playlist.get("owner", {}).get("id", "")
+
+    log.info("\n-- Playlist %d/%d: '%s' (owner: %s) --", idx, total, name, owner_id)
+
+    try:
+        tracks = spotify_get_tracks_in_playlist(pl_id)
+    except requests.HTTPError as exc:
+        if exc.response is not None and exc.response.status_code == 403:
+            log.warning("  Skipped: no access to '%s' (followed playlist of '%s').",
+                        name, owner_id)
+        else:
+            log.error("  Error fetching tracks of '%s': %s", name, exc)
+        return
+    except Exception as exc:
+        log.error("  Error fetching tracks of '%s': %s", name, exc)
+        return
+
+    log.info("  %d tracks found.", len(tracks))
+    if not tracks:
+        log.info("  Empty playlist, skipping.")
+        return
+
+    try:
+        tidal_pl = _get_or_create_tidal_playlist(tidal_session, name, pl_id)
+    except Exception as exc:
+        log.error("  Could not create/clear Tidal playlist: %s", exc)
+        return
+
+    tidal_ids = _resolve_tracks(tidal_session, tracks, cache, stats)
+    _push_tracks_to_tidal(tidal_pl, tidal_ids)
+
+    log.info("  OK: %d/%d tracks added to '%s'.", len(tidal_ids), len(tracks), name)
+
+
 def migrate_playlists() -> None:
+    """Entry point for migration: sets up sessions, iterates playlists, logs summary."""
     if not os.getenv("SPOTIFY_ACCESS_TOKEN", SPOTIFY_ACCESS_TOKEN):
         log.error("SPOTIFY_ACCESS_TOKEN missing. Run --auth-spotify first.")
         sys.exit(1)
 
     tidal_session = tidal_load_or_login()
     cache         = load_cache()
+    stats         = MigrationStats()
 
     spotify_check_and_refresh()
-    spotify_user_id = spotify_get_current_user_id()
-    log.info("Logged in as Spotify user: %s", spotify_user_id)
+    log.info("Logged in as Spotify user: %s", spotify_get_current_user_id())
 
     playlists = spotify_get_all_playlists()
     log.info("Found %d playlists on Spotify.", len(playlists))
 
-    total_found     = 0
-    total_not_found = 0
-    not_found_log: list[str] = []
-
     for idx, playlist in enumerate(playlists, start=1):
-        pl_name  = playlist.get("name", f"Playlist {idx}")
-        pl_id    = playlist.get("id")
-        owner_id = playlist.get("owner", {}).get("id", "")
-        if not pl_id:
+        if not playlist.get("id"):
             continue
-
-        log.info("\n-- Playlist %d/%d: '%s' (owner: %s) --",
-                 idx, len(playlists), pl_name, owner_id)
-
-        # Fetch tracks — 403 means this is a followed playlist owned by someone else
-        try:
-            tracks = spotify_get_tracks_in_playlist(pl_id)
-        except requests.HTTPError as exc:
-            if exc.response is not None and exc.response.status_code == 403:
-                log.warning("  Skipped: no access to tracks of '%s' "
-                            "(followed playlist owned by '%s').",
-                            pl_name, owner_id)
-            else:
-                log.error("  Error fetching tracks of '%s': %s", pl_name, exc)
-            continue
-        except Exception as exc:
-            log.error("  Error fetching tracks of '%s': %s", pl_name, exc)
-            continue
-
-        log.info("  %d tracks found.", len(tracks))
-        if not tracks:
-            log.info("  Empty playlist, skipping.")
-            continue
-
-        # Create Tidal playlist or clear existing one with the same name
-        try:
-            existing = [p for p in tidal_session.user.playlists()
-                        if p.name == pl_name]
-            if existing:
-                tidal_pl = existing[0]
-                log.info("  Existing Tidal playlist found (id=%s), clearing ...",
-                         tidal_pl.id)
-                current_tracks = tidal_pl.tracks()
-                if current_tracks:
-                    tidal_pl.remove_by_indices(list(range(len(current_tracks))))
-                log.info("  Playlist cleared (%d tracks removed).",
-                         len(current_tracks))
-            else:
-                tidal_pl = tidal_session.user.create_playlist(
-                    pl_name, f"Migrated from Spotify ({pl_id})"
-                )
-                log.info("  New Tidal playlist created (id=%s).", tidal_pl.id)
-        except Exception as exc:
-            log.error("  Could not create/clear Tidal playlist: %s", exc)
-            continue
-
-        # Look up each track on Tidal
-        tidal_ids: list[int] = []
-        for track in tracks:
-            t_name  = track.get("name", "Unknown")
-            artists = ", ".join(a["name"] for a in track.get("artists", []))
-            isrc    = track.get("external_ids", {}).get("isrc")
-
-            tidal_id = search_tidal(tidal_session, isrc, t_name, artists, cache)
-
-            if tidal_id:
-                tidal_ids.append(tidal_id)
-                total_found += 1
-                log.info("  + %s - %s", t_name, artists)
-            else:
-                msg = f"Not found: '{t_name}' - {artists} (ISRC={isrc})"
-                log.warning("  x %s", msg)
-                not_found_log.append(msg)
-                total_not_found += 1
-
-        # Deduplicate and add in batches of 50
-        tidal_ids = list(dict.fromkeys(tidal_ids))
-        for i in range(0, len(tidal_ids), 50):
-            chunk = tidal_ids[i : i + 50]
-            tidal_pl.add(chunk)
-            log.info("  -> Batch %d: %d tracks added.",
-                     i // 50 + 1, len(chunk))
-            time.sleep(REQUEST_DELAY)
-
-        log.info("  OK: %d/%d tracks added to '%s'.",
-                 len(tidal_ids), len(tracks), pl_name)
-
-        # Save cache and session after each playlist
+        _migrate_playlist(playlist, idx, len(playlists), tidal_session, cache, stats)
         save_cache(cache)
         _tidal_save_session(tidal_session)
 
-    log.info("\n" + "=" * 50)
-    log.info("Migration complete!")
-    log.info("Tracks found    : %d", total_found)
-    log.info("Tracks not found: %d", total_not_found)
-    if not_found_log:
-        log.info("\nNot found:")
-        for entry in not_found_log:
-            log.info("  - %s", entry)
+    stats.log_summary()
 
 # ---------------------------------------------------------------------------
 # CLI
