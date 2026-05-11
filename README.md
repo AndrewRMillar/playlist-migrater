@@ -49,7 +49,8 @@ Migrates all your Spotify playlists to Tidal using ISRC-based track matching, wi
 ## Step 3 – Installation
 
 ```bash
-# Clone or copy the project folder
+# Clone the project
+git clone git@github.com:AndrewRMillar/playlist-migrater.git
 cd ~/playlist-migrator
 
 # Create a virtual environment
